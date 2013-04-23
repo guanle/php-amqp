@@ -321,6 +321,7 @@ typedef struct _amqp_connection_object {
 	char *vhost;
 	int vhost_len;
 	int port;
+	double timeout;
 	double read_timeout;
 	double write_timeout;
 	amqp_connection_resource *connection_resource;

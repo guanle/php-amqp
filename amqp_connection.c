@@ -93,6 +93,10 @@ HashTable *amqp_connection_object_get_debug_info(zval *object, int *is_temp TSRM
 	zend_hash_add(debug_info, "port", sizeof("port"), &value, sizeof(zval *), NULL);
 
 	MAKE_STD_ZVAL(value);
+	ZVAL_DOUBLE(value, connection->timeout);
+	zend_hash_add(debug_info, "timeout", sizeof("timeout"), &value, sizeof(zval *), NULL);
+
+	MAKE_STD_ZVAL(value);
 	ZVAL_DOUBLE(value, connection->read_timeout);
 	zend_hash_add(debug_info, "read_timeout", sizeof("read_timeout"), &value, sizeof(zval *), NULL);
 
@@ -156,7 +160,13 @@ int php_amqp_connect(amqp_connection_object *connection, int persistent TSRMLS_D
 	connection->connection_resource->connection_state = amqp_new_connection();
 
 	/* Get the connection socket out */
-	connection->connection_resource->fd = amqp_open_socket(connection->host, connection->port);
+	struct timeval timeout;
+	timeout.tv_sec = (int) floor(connection->timeout);
+	timeout.tv_usec = (int) ((connection->timeout - floor(connection->timeout)) * 1.e+6);
+	if(connection->timeout>0)
+		connection->connection_resource->fd = amqp_open_socket(connection->host, connection->port, &timeout);
+	else
+		connection->connection_resource->fd = amqp_open_socket(connection->host, connection->port, NULL);
 
 	/* Verify that we actually got a connectio back */
 	if (connection->connection_resource->fd < 1) {
@@ -567,36 +577,16 @@ PHP_METHOD(amqp_connection_class, __construct)
 		} else {
 			connection->read_timeout = Z_DVAL_PP(zdata);
 		}
+	}
 
-		if (ini_arr && SUCCESS == zend_hash_find(HASH_OF (ini_arr), "timeout", sizeof("timeout"), (void*)&zdata)) {
-			/* 'read_timeout' takes precedence on 'timeout' but users have to know this */
-			php_error_docref(NULL TSRMLS_CC, E_NOTICE, "Parameter 'timeout' is deprecated, 'read_timeout' used instead");
-		}
-
-	} else if (ini_arr && SUCCESS == zend_hash_find(HASH_OF (ini_arr), "timeout", sizeof("timeout"), (void*)&zdata)) {
-
-		php_error_docref(NULL TSRMLS_CC, E_DEPRECATED, "Parameter 'timeout' is deprecated; use 'read_timeout' instead");
-
+	connection->timeout = INI_FLT("amqp.timeout");
+	if (ini_arr && SUCCESS == zend_hash_find(HASH_OF (ini_arr), "timeout", sizeof("timeout"), (void*)&zdata)) {
 		convert_to_double(*zdata);
 		if (Z_DVAL_PP(zdata) < 0) {
 			zend_throw_exception(amqp_connection_exception_class_entry, "Parameter 'timeout' must be greater than or equal to zero.", 0 TSRMLS_CC);
 		} else {
-			connection->read_timeout = Z_DVAL_PP(zdata);
+			connection->timeout = Z_DVAL_PP(zdata);
 		}
-	} else {
-
-	   if (DEFAULT_TIMEOUT != INI_STR("amqp.timeout")) {
-		   php_error_docref(NULL TSRMLS_CC, E_DEPRECATED, "INI setting 'amqp.timeout' is deprecated; use 'amqp.read_timeout' instead");
-
-		   if (DEFAULT_READ_TIMEOUT == INI_STR("amqp.read_timeout")) {
-				connection->read_timeout = INI_FLT("amqp.timeout");
-		   } else {
-				php_error_docref(NULL TSRMLS_CC, E_NOTICE, "INI setting 'amqp.read_timeout' will be used instead of 'amqp.timeout'");
-				connection->read_timeout = INI_FLT("amqp.read_timeout");
-		   }
-	   } else {
-			connection->read_timeout = INI_FLT("amqp.read_timeout");
-	   }
 	}
 
 	connection->write_timeout = INI_FLT("amqp.write_timeout");
@@ -1092,8 +1082,6 @@ PHP_METHOD(amqp_connection_class, getTimeout)
 	zval *id;
 	amqp_connection_object *connection;
 
-	php_error_docref(NULL TSRMLS_CC, E_DEPRECATED, "AMQPConnection::getTimeout() method is deprecated; use AMQPConnection::getReadTimeout() instead");
-
 	/* Get the timeout from the method params */
 	if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(), "O", &id, amqp_connection_class_entry) == FAILURE) {
 		return;
@@ -1103,7 +1091,7 @@ PHP_METHOD(amqp_connection_class, getTimeout)
 	connection = (amqp_connection_object *)zend_object_store_get_object(id TSRMLS_CC);
 
 	/* Copy the timeout to the amqp object */
-	RETURN_DOUBLE(connection->read_timeout);
+	RETURN_DOUBLE(connection->timeout);
 }
 /* }}} */
 
@@ -1114,17 +1102,15 @@ PHP_METHOD(amqp_connection_class, setTimeout)
 {
 	zval *id;
 	amqp_connection_object *connection;
-	double read_timeout;
-
-	php_error_docref(NULL TSRMLS_CC, E_DEPRECATED, "AMQPConnection::setTimeout($timeout) method is deprecated; use AMQPConnection::setReadTimeout($timeout) instead");
+	double timeout;
 
 	/* Get the timeout from the method params */
-	if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(), "Od", &id, amqp_connection_class_entry, &read_timeout) == FAILURE) {
+	if (zend_parse_method_parameters(ZEND_NUM_ARGS() TSRMLS_CC, getThis(), "Od", &id, amqp_connection_class_entry, &timeout) == FAILURE) {
 		return;
 	}
 
 	/* Validate timeout */
-	if (read_timeout < 0) {
+	if (timeout < 0) {
 		zend_throw_exception(amqp_connection_exception_class_entry, "Parameter 'timeout' must be greater than or equal to zero.", 0 TSRMLS_CC);
 		return;
 	}
@@ -1133,12 +1119,12 @@ PHP_METHOD(amqp_connection_class, setTimeout)
 	connection = (amqp_connection_object *)zend_object_store_get_object(id TSRMLS_CC);
 
 	/* Copy the timeout to the amqp object */
-	connection->read_timeout = read_timeout;
+	connection->timeout = timeout;
 
 	if (connection->is_connected == '\1') {
-		if (php_amqp_set_read_timeout(connection TSRMLS_CC) == 0) {
-			RETURN_FALSE;
-		}
+		//if (php_amqp_set_read_timeout(connection TSRMLS_CC) == 0) {
+		//	RETURN_FALSE;
+		//}
 	}
 
 	RETURN_TRUE;
